@@ -1,3 +1,4 @@
+import traceback
 from asyncio import gather, Semaphore, sleep, Task, CancelledError
 from datetime import datetime
 from statistics import median
@@ -12,9 +13,11 @@ from sqlalchemy.exc import OperationalError
 
 from .db import SIGHTING_CACHE, MYSTERY_CACHE, FORT_CACHE
 from .utils import get_current_hour, dump_pickle, get_start_coords, get_bootstrap_points, randomize_point, best_factors, percentage_split
-from .shared import get_logger, LOOP, run_threaded, ACCOUNTS
+from .shared import get_logger, LOOP, run_threaded
+from .accounts import get_accounts 
 from . import bounds, db_proc, spawns, sanitized as conf
 from .worker import Worker
+from .notification import Notifier
 
 ANSI = '\x1b[2J\x1b[H'
 if platform == 'win32':
@@ -80,6 +83,7 @@ class Overseer:
         if conf.MAP_WORKERS:
             Worker.worker_dict = self.manager.worker_dict()
 
+        ACCOUNTS = get_accounts()
         for username, account in ACCOUNTS.items():
             account['username'] = username
             if account.get('banned') or account.get('warn') or account.get('sbanned'):
@@ -93,6 +97,7 @@ class Overseer:
             try:
                 self.workers.append(Worker(worker_no=x))
             except Exception as e:
+                traceback.print_exc()
                 self.log.error("Worker initialization error: {}", e)
         self.log.info("Worker count: ({}/{})", len(self.workers), conf.GRID[0] * conf.GRID[1])
 
@@ -358,8 +363,10 @@ class Overseer:
         if not pickle or not spawns.unpickle():
             await self.update_spawns(initial=True)
 
-        if pickle:
-            FORT_CACHE.unpickle()
+        FORT_CACHE.preload()
+        #if pickle:
+        #    FORT_CACHE.unpickle()
+        FORT_CACHE.pickle()
 
         if not spawns or bootstrap:
             try:
@@ -388,6 +395,7 @@ class Overseer:
     async def _launch(self, update_spawns):
         if update_spawns:
             await self.update_spawns()
+            ACCOUNTS = get_accounts()
             LOOP.create_task(run_threaded(dump_pickle, 'accounts', ACCOUNTS))
             spawns_iter = iter(spawns.items())
         else:
@@ -451,28 +459,35 @@ class Overseer:
                     self.visits += 1
 
     async def bootstrap(self):
+        notifier = Notifier()
         try:
             self.log.warning('Starting bootstrap phase 1.')
+            LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'Starting bootstrap phase 1.', '65300'))
             await self.bootstrap_one()
         except CancelledError:
             raise
         except Exception:
             self.log.exception('An exception occurred during bootstrap phase 1.')
+            LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'An exception occurred during bootstrap phase 1.', '16060940'))
 
         try:
             self.log.warning('Starting bootstrap phase 2.')
+            LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'Starting bootstrap phase 2.', '65300'))
             await self.bootstrap_two()
         except CancelledError:
             raise
         except Exception:
             self.log.exception('An exception occurred during bootstrap phase 2.')
+            LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'An exception occurred during bootstrap phase 2.', '16060940'))
 
         self.log.warning('Starting bootstrap phase 3.')
+        LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'Starting bootstrap phase 3.', '65300'))
         unknowns = list(spawns.unknown)
         shuffle(unknowns)
         tasks = (self.try_again(point) for point in unknowns)
         await gather(*tasks, loop=LOOP)
         self.log.warning('Finished bootstrapping.')
+        LOOP.create_task(notifier.scan_log_webhook('Bootstrap Status Change', 'Finished bootstrapping.', '65300'))
 
     async def bootstrap_one(self):
         async def visit_release(worker, num, *args):
@@ -556,6 +571,7 @@ class Overseer:
             await sleep(conf.SEARCH_SLEEP, loop=LOOP)
 
     def refresh_dict(self):
+        ACCOUNTS = get_accounts()
         while not self.extra_queue.empty():
             account = self.extra_queue.get()
             username = account['username']
