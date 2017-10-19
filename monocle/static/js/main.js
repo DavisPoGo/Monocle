@@ -383,7 +383,12 @@ function addGymsToMap (data, map) {
 
 function addSpawnsToMap (data, map) {
     data.forEach(function (item) {
+        var userPreference = getPreference('filter-'+item.top);
         var circle = L.circle([item.lat, item.lon], 5, {weight: 2});
+        if (userPreference === 'pokemon'){
+            var icon = new PokemonIcon({iconUrl: '/static/monocle-icons/icons/' + item.top + '.png', expires_at: 0});
+            var circle = L.marker([item.lat, item.lon], {icon: icon, opacity: 1});
+        }
         var time = '??';
         if (item.despawn_time != null) {
             time = '' + Math.floor(item.despawn_time/60) + 'min ' +
