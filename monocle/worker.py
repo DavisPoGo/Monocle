@@ -715,7 +715,8 @@ class Worker:
         return False
 
     async def visit(self, point, spawn_id=None, bootstrap=False,
-            encounter_id=None, encounter_only=False, sighting=None):
+            encounter_id=None, encounter_only=False, sighting=None,
+            visiting_pokestop=False):
         """Wrapper for self.visit_point - runs it a few times before giving up
 
         Also is capable of restarting in case an error occurs.
@@ -736,6 +737,10 @@ class Worker:
 
             if sb_detector:
                 await sb_detector.detect(self.account)
+
+            if not visiting_pokestop and self.player_level is not None and self.player_level <= 1:
+                await self.visit_nearest_pokestop(point)
+
             try:
                 self.altitude = altitudes.get(point)
             except KeyError:
@@ -840,7 +845,6 @@ class Worker:
             err = str(e)
             self.log.error(err)
             print(err)
-            # exit()
             time.sleep(5)
         except (ex.MalformedResponseException, ex.UnexpectedResponseException) as e:
             self.log.warning('{} Giving up.', e)
@@ -1006,6 +1010,7 @@ class Worker:
                             raise
                         except Exception as e:
                             self.log.warning('{} during encounter by {}', e.__class__.__name__, self.username)
+                            raise e
 
                     if not encountered and conf.PGSCOUT_ENDPOINT:
                         async with ClientSession(loop=LOOP) as session:
@@ -1130,6 +1135,30 @@ class Worker:
 
         return pokemon_seen + forts_seen + points_seen
 
+    async def visit_nearest_pokestop(self, from_point):
+        while self.overseer.running:
+            closest = float('inf')
+            chosen_point = None
+            for psid, point in FORT_CACHE.pokestops.items():
+                distance = get_distance(from_point, point)
+                if distance < closest:
+                    closest = distance
+                    chosen_point = point
+                if closest < 500:
+                    break
+            if chosen_point:
+                closest = get_distance(from_point, point, UNIT)
+                time_needed = 3600.0 * closest / conf.SPEED_LIMIT
+                self.log.info("{}(Lv.{}) is going to {}{} for a spin which is {:.2f} {} away and will take {}s.",
+                        self.username, self.player_level,
+                        FORT_CACHE.pokestop_names.get(psid),
+                        chosen_point, closest, conf.SPEED_UNIT, int(time_needed))
+                await sleep(time_needed, loop=LOOP)
+                return await self.visit(chosen_point, visiting_pokestop=True)
+            else:
+                self.log.info("{} is needs a spin but couldn't find a spot.", self.username)
+                return False
+
     async def visit_encounter(self, point, sighting):
         self.handle.cancel()
         start = time()
@@ -1148,6 +1177,7 @@ class Worker:
             raise
         except Exception as e:
             self.log.warning('{} during encounter by {}', e.__class__.__name__, self.username)
+            raise e
 
         should_notify = self.should_notify(sighting)
         if should_notify:
@@ -1165,7 +1195,7 @@ class Worker:
 
         self.update_accounts_dict()
         self.handle = LOOP.call_later(60, self.unset_code)
-        return True 
+        return 1 
 
     def should_skip_sighting(self, sighting, cache):
         # Check if already marked for save as sighting
@@ -1321,7 +1351,7 @@ class Worker:
             return
 
         if result == 1:
-            self.log.info('Spun {}.', name)
+            self.log.info('{} spun {}.', self.username, name)
             try:
                 inventory_items = responses['GET_INVENTORY'].inventory_delta.inventory_items
                 for item in inventory_items:
@@ -1331,7 +1361,7 @@ class Worker:
                         request = self.api.create_request()
                         request.level_up_rewards(level=level)
                         await self.call(request)
-                        self.log.info('Level up, get rewards.', name)
+                        self.log.info('{} leveled up to Lv.{}, get rewards.', self.username, level)
                         self.player_level = level
                         break
             except KeyError:
@@ -1559,12 +1589,13 @@ class Worker:
             self.account['expiry'] = self.api.auth_provider._access_token_expiry
         except AttributeError:
             pass
-
+        
         ACCOUNTS = self.account_dict
         if 'remove' in self.account and self.account['remove']:
             if self.username in ACCOUNTS:
                 del ACCOUNTS[self.username]
         else:
+            Account.put(self.account)
             ACCOUNTS[self.username] = self.account
 
     async def remove_account(self, flag='banned'):
@@ -1596,7 +1627,6 @@ class Worker:
         else:
             self.account['banned'] = True
             self.log.warning('Hibernating {} due to ban.', self.username)
-        Account.put(self.account)
         self.update_accounts_dict()
         self.username = None
         self.account = None
