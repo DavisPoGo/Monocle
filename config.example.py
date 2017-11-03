@@ -44,7 +44,7 @@ GRID = (4, 4)  # rows, columns
 ### Lv30 accounts to pull from DB in percentage of total workers for encounter.
 ### Setting this will enable Lv30 pool for encounters
 ### Default 0.0(0%)
-#LV30_PERCENT_OF_WORKERS = 0.0
+LV30_PERCENT_OF_WORKERS = 0.0
 #
 ### For example, if you want to have 5% level 30 acccounts for encounter, set
 #LV30_PERCENT_OF_WORKERS = 0.05
