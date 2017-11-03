@@ -20,11 +20,12 @@ from .utils import round_coords, load_pickle, get_device_info, get_start_coords,
 from .shared import get_logger, LOOP, SessionManager, run_threaded, TtlCache
 from .sb import SbDetector, SbAccountException
 from .accounts import Account, get_accounts, InsufficientAccountsException, LoginCredentialsException, \
-        EmailUnverifiedException, SecurityLockException
+        EmailUnverifiedException, SecurityLockException, TempDisabledException
 from . import altitudes, avatar, bounds, db_proc, spawns, sanitized as conf
 from .notification import Notifier
 
-HARDCORE_HYPERDRIVE = (not conf.LV30_GMO)
+from python_anticaptcha import AnticaptchaClient, NoCaptchaTaskProxylessTask
+from python_anticaptcha.exceptions import AnticatpchaException
 
 if conf.CACHE_CELLS:
     from array import typecodes
@@ -62,6 +63,9 @@ class Worker:
     scan_delay = conf.SCAN_DELAY if conf.SCAN_DELAY >= 10 else 10
     g = {'seen': 0, 'captchas': 0}
     more_point_cell_cache = TtlCache(ttl=300) 
+    has_raiders = (conf.RAIDERS_PER_GYM and conf.RAIDERS_PER_GYM > 0)
+    scan_gym = conf.GYM_NAMES or conf.GYM_DEFENDERS
+    passive_scan_gym = (scan_gym and not has_raiders)
 
     if conf.CACHE_CELLS:
         cells = load_pickle('cells') or {}
@@ -80,6 +84,7 @@ class Worker:
 
     login_semaphore = Semaphore(conf.SIMULTANEOUS_LOGINS, loop=LOOP)
     sim_semaphore = Semaphore(conf.SIMULTANEOUS_SIMULATION, loop=LOOP)
+    update_account_lock = Lock(loop=LOOP)
 
     multiproxy = False
     if conf.PROXIES:
@@ -133,7 +138,7 @@ class Worker:
                 self.account['items'] = {}
                 self.items = self.account['items']
             self.inventory_timestamp = self.account.get('inventory_timestamp', 0) if self.items else 0
-            self.player_level = self.account.get('level')
+            self.player_level = self.account.get('level', 0)
             self.initialize_api()
         else:
             self.last_request = 0 
@@ -158,10 +163,11 @@ class Worker:
         self.item_capacity = 350
         self.visits = 0
         self.pokestops = conf.SPIN_POKESTOPS
-        self.gyms = conf.GET_GYM_DETAILS
         self.next_spin = 0
         self.handle = HandleStub()
-        self.next_gym = 0
+
+    def needs_sleep(self):
+        return True 
 
     def min_level(self):
         return 0
@@ -224,11 +230,13 @@ class Worker:
                 await self.swap_account('unexpected auth error')
             except ex.AuthException as e:
                 msg = str(e)
-                if ("you have failed to log in correctly too many times" in msg
-                        or "Your username or password is incorrect" in msg):
-                    raise LoginCredentialsException("Username or password is wrong.")
+                if ("Your username or password is incorrect" in msg):
+                    if attempt >= min(1,conf.MAX_RETRIES - 1):
+                        raise LoginCredentialsException("Username or password is wrong.")
                 elif "email not verified" in msg:
                     raise EmailUnverifiedException("Account email not verified")
+                elif "your account has been disabled for 15 minutes" in msg:
+                    raise TempDisabledException("Account disabled for 15 mins due to multiple failed logins")
                 elif "has been locked for security reasons" in msg:
                     raise SecurityLockException("Account locked for security reason. Reset password needed")
                 err = e
@@ -568,7 +576,7 @@ class Worker:
             if inbox:
                 request.get_inbox(is_history=True)
 
-        if action and (not HARDCORE_HYPERDRIVE):
+        if action and (self.needs_sleep()):
             now = time()
             # wait for the time required, or at least a half-second
             if self.last_action > now + .5:
@@ -700,6 +708,16 @@ class Worker:
         speed = (distance / time_diff) * 3600
         return speed
 
+    async def sleep_travel_time(self, point, max_speed=conf.SPEED_LIMIT):
+        distance = get_distance(self.location, point, UNIT)
+        time_needed = 3600.0 * distance / max_speed
+        if self.username:
+            if time_needed > 0.0:
+                self.log.info("{} needs {}s of travel time.", self.username, int(time_needed))
+                await sleep(time_needed, loop=LOOP)
+                return True
+        return False
+
     async def account_promotion(self):
         if self.player_level and self.player_level >= 30:
             self.log.warning('Congratulations {} has reached Lv.30. Moving it out of low-level slave pool', self.username)
@@ -716,7 +734,7 @@ class Worker:
 
     async def visit(self, point, spawn_id=None, bootstrap=False,
             encounter_id=None, encounter_only=False, sighting=None,
-            visiting_pokestop=False):
+            visiting_pokestop=False, gym=None):
         """Wrapper for self.visit_point - runs it a few times before giving up
 
         Also is capable of restarting in case an error occurs.
@@ -753,7 +771,7 @@ class Worker:
                 return await self.visit_encounter(point, sighting)
             else:
                 return await self.visit_point(point, spawn_id, bootstrap,
-                        encounter_id=encounter_id)
+                        encounter_id=encounter_id, gym=gym)
         except ex.NotLoggedInException:
             self.error_code = 'NOT AUTHENTICATED'
             await sleep(1, loop=LOOP)
@@ -762,7 +780,8 @@ class Worker:
             return await self.visit(point, spawn_id, bootstrap,
                     encounter_id=encounter_id,
                     encounter_only=encounter_only,
-                    sighting=sighting)
+                    sighting=sighting,
+                    gym=gym)
         except ex.AuthException as e:
             self.log.warning('Auth error on {} in visit: {}', self.username, e)
             self.error_code = 'NOT AUTHENTICATED'
@@ -778,13 +797,18 @@ class Worker:
             self.error_code = 'SECURITY LOCK'
             await sleep(3, loop=LOOP)
             await self.remove_account(flag='security')
+        except TempDisabledException as e:
+            self.log.warning('Temp disabled error on {}: {}', self.username, e)
+            self.error_code = 'TEMP DISABLED'
+            await sleep(3, loop=LOOP)
+            await self.remove_account(flag='temp_disabled')
         except EmailUnverifiedException as e:
             self.log.warning('Email verification error on {}: {}', self.username, e)
             self.error_code = 'UNVERIFIED'
             await sleep(3, loop=LOOP)
             await self.remove_account(flag='unverified')
         except InsufficientAccountsException as e:
-            self.update_accounts_dict()
+            await self.update_accounts_dict()
             raise InsufficientAccountsException("No more accounts to pull from DB.") from e
         except CaptchaException:
             self.error_code = 'CAPTCHA'
@@ -867,8 +891,9 @@ class Worker:
 
     async def visit_point(self, point, spawn_id, bootstrap,
             encounter_conf=conf.ENCOUNTER, notify_conf=conf.NOTIFY,
-            more_points=conf.MORE_POINTS, encounter_id=None):
+            more_points=conf.MORE_POINTS, encounter_id=None, gym=None):
         self.handle.cancel()
+        gmo_success = False
         self.error_code = '∞' if bootstrap else '!'
 
         self.log.info('{0} is visiting {1[0]:.4f}, {1[1]:.4f}', self.username, point)
@@ -884,7 +909,6 @@ class Worker:
                                 since_timestamp_ms=since_timestamp_ms,
                                 latitude=point[0],
                                 longitude=point[1])
-
         diff = self.last_gmo + self.scan_delay - time()
         if diff > 0:
             await sleep(diff, loop=LOOP)
@@ -911,6 +935,10 @@ class Worker:
         points_seen = 0
         seen_target = not spawn_id
         seen_encounter = not encounter_id
+        seen_gym = not gym
+        gmo_success = True
+
+        scan_gym_external_id = gym.get('external_id') if gym else None
 
         if conf.ITEM_LIMITS and self.bag_items >= self.item_capacity:
             await self.clean_bag()
@@ -1000,7 +1028,8 @@ class Worker:
                         try:
                             if await self.encounter(normalized, pokemon.spawn_point_id):
                                 self.overseer.Worker30.encounters += 1
-                                await self.random_sleep(2.0, 5.0)
+                                if self.needs_sleep():
+                                    await self.random_sleep(2.0, 5.0)
                                 encountered = True
                             else:
                                 if sb_detector:
@@ -1021,7 +1050,7 @@ class Worker:
 
                 db_proc.add(normalized)
 
-            if self.gyms:
+            if self.passive_scan_gym:
                 priority_fort = self.prioritize_forts(map_cell.forts)
             else:
                 priority_fort = None
@@ -1041,11 +1070,11 @@ class Worker:
                         if norm not in SIGHTING_CACHE:
                             SIGHTING_CACHE.add(norm)
                             db_proc.add(norm)
-                    if (self.pokestops and
-                            self.bag_items < self.item_capacity
-                            and time() > self.next_spin
-                            and (not conf.SMART_THROTTLE or
-                            self.smart_throttle(2))):
+                    if (self.player_level <= 1 or
+                            (self.pokestops and self.bag_items < self.item_capacity and
+                                time() > self.next_spin and
+                                (not conf.SMART_THROTTLE or
+                                    self.smart_throttle(2)))):
                         cooldown = fort.cooldown_complete_timestamp_ms
                         if not cooldown or time() > cooldown / 1000:
                             await self.spin_pokestop(fort)
@@ -1054,15 +1083,32 @@ class Worker:
                         db_proc.add(pokestop)
                 else:
                     normalized_fort = self.normalize_gym(fort)
-                    if fort not in FORT_CACHE:
-                        FORT_CACHE.add(normalized_fort)
-                        if (priority_fort and
-                                priority_fort.id == fort.id and
-                                time() > self.next_gym and self.smart_throttle(1)):
+                    is_target_gym = (scan_gym_external_id == fort.id)
+                    should_update_gym = is_target_gym
 
+                    if is_target_gym:
+                        seen_gym = True
+
+                    self.overseer.WorkerRaider.add_gym(normalized_fort)
+
+                    if (scan_gym_external_id or not self.has_raiders) and fort not in FORT_CACHE:
+                        FORT_CACHE.add(normalized_fort)
+                        should_update_gym = True
+
+                    if (is_target_gym or
+                            (priority_fort and
+                                priority_fort.id == fort.id)):
+
+                        needs_name = (conf.GYM_NAMES and (fort.id not in FORT_CACHE.gym_names))
+                        needs_defenders = conf.GYM_DEFENDERS
+
+                        if needs_name or needs_defenders:
                             gym = await self.gym_get_info(normalized_fort)
                             if gym:
+                                should_update_gym = True
                                 self.log.info('Got gym info for {}', normalized_fort["name"])
+
+                    if should_update_gym:
                         db_proc.add(normalized_fort)
 
                     if fort.HasField('raid_info'):
@@ -1103,7 +1149,8 @@ class Worker:
             self.g['seen'] += pokemon_seen
             self.empty_visits = 0
         else:
-            self.empty_visits += 1
+            if (not gym) and (not encounter_id):
+                self.empty_visits += 1
             if sb_detector:
                 sb_detector.add_empty_visit(self.account)
             if forts_seen == 0:
@@ -1127,11 +1174,15 @@ class Worker:
             self.username
         )
 
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         self.handle = LOOP.call_later(60, self.unset_code)
 
-        if not seen_encounter:
-            return -1 
+        if gmo_success:
+            if not seen_encounter:
+                return -1 
+
+            if not seen_gym:
+                return -1
 
         return pokemon_seen + forts_seen + points_seen
 
@@ -1149,6 +1200,8 @@ class Worker:
             if chosen_point:
                 closest = get_distance(from_point, point, UNIT)
                 time_needed = 3600.0 * closest / conf.SPEED_LIMIT
+                if self.last_request > 0 and time_needed > 300.0:
+                    return False
                 self.log.info("{}(Lv.{}) is going to {}{} for a spin which is {:.2f} {} away and will take {}s.",
                         self.username, self.player_level,
                         FORT_CACHE.pokestop_names.get(psid),
@@ -1193,7 +1246,7 @@ class Worker:
                 (point, start, self.speed, self.total_seen,
                 self.visits, pokemon_seen))])
 
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         self.handle = LOOP.call_later(60, self.unset_code)
         return 1 
 
@@ -1216,7 +1269,8 @@ class Worker:
                 or (encounter_conf == 'some'
                     and sighting['pokemon_id'] in conf.ENCOUNTER_IDS))
         should_notify_with_iv = (should_notify and not conf.IGNORE_IVS)
-        return encounter_whitelisted or should_notify_with_iv
+        sp_discovered = ('despawn' in sighting)
+        return (sp_discovered and (encounter_whitelisted or should_notify_with_iv))
 
     async def pgscout(self, session, pokemon, spawn_id):
         PGScout_address=next(self.PGScout_cycle)
@@ -1298,7 +1352,6 @@ class Worker:
             self.log.info('The server said {} was out of gym details range. {:.1f}m {:.1f}{}',
                 name, distance, self.speed, UNIT_STRING)
 
-        self.next_gym = time() + conf.GYM_COOLDOWN
         self.error_code = '!'
         
         return gym 
@@ -1403,7 +1456,7 @@ class Worker:
             self.simulate_jitter()
             delay_required = 1.1
 
-        if not HARDCORE_HYPERDRIVE:
+        if self.needs_sleep():
             await self.random_sleep(delay_required, delay_required + 1.5)
 
         request = self.api.create_request()
@@ -1511,64 +1564,78 @@ class Worker:
 
         self.error_code = 'C'
         self.num_captchas += 1
-
         session = SessionManager.get()
-        try:
-            params = {
-                'key': conf.CAPTCHA_KEY,
-                'method': 'userrecaptcha',
-                'googlekey': '6LeeTScTAAAAADqvhqVMhPpr_vB9D364Ia-1dSgK',
-                'pageurl': challenge_url,
-                'json': 1
-            }
-            async with session.post('http://2captcha.com/in.php', params=params) as resp:
-                response = await resp.json(loads=json_loads)
-        except CancelledError:
-            raise
-        except Exception as e:
-            self.log.error('Got an error while trying to solve CAPTCHA. '
-                           'Check your API Key and account balance.')
-            raise CaptchaSolveException from e
 
-        code = response.get('request')
-        if response.get('status') != 1:
-            if code in ('ERROR_WRONG_USER_KEY', 'ERROR_KEY_DOES_NOT_EXIST', 'ERROR_ZERO_BALANCE'):
-                conf.CAPTCHA_KEY = None
-                self.log.error('2Captcha reported: {}, disabling CAPTCHA solving', code)
-            else:
-                self.log.error("Failed to submit CAPTCHA for solving: {}", code)
-            raise CaptchaSolveException
-
-        try:
-            # Get the response, retry every 5 seconds if it's not ready
-            params = {
-                'key': conf.CAPTCHA_KEY,
-                'action': 'get',
-                'id': code,
-                'json': 1
-            }
-            while True:
-                async with session.get("http://2captcha.com/res.php", params=params, timeout=20) as resp:
+        if not conf.USE_ANTICAPTCHA:
+            try:
+                params = {
+                    'key': conf.CAPTCHA_KEY,
+                    'method': 'userrecaptcha',
+                    'googlekey': '6LeeTScTAAAAADqvhqVMhPpr_vB9D364Ia-1dSgK',
+                    'pageurl': challenge_url,
+                    'json': 1
+                }
+                async with session.post('http://2captcha.com/in.php', params=params) as resp:
                     response = await resp.json(loads=json_loads)
-                if response.get('request') != 'CAPCHA_NOT_READY':
-                    break
-                await sleep(5, loop=LOOP)
-        except CancelledError:
-            raise
-        except Exception as e:
-            self.log.error('Got an error while trying to solve CAPTCHA. '
-                              'Check your API Key and account balance.')
-            raise CaptchaSolveException from e
+            except CancelledError:
+                raise
+            except Exception as e:
+                self.log.error('Got an error while trying to solve CAPTCHA. '
+                               'Check your API Key and account balance.')
+                raise CaptchaSolveException from e
 
-        token = response.get('request')
-        if not response.get('status') == 1:
-            self.log.error("Failed to get CAPTCHA response: {}", token)
-            raise CaptchaSolveException
+            code = response.get('request')
+            if response.get('status') != 1:
+                if code in ('ERROR_WRONG_USER_KEY', 'ERROR_KEY_DOES_NOT_EXIST', 'ERROR_ZERO_BALANCE'):
+                    conf.CAPTCHA_KEY = None
+                    self.log.error('2Captcha reported: {}, disabling CAPTCHA solving', code)
+                else:
+                    self.log.error("Failed to submit CAPTCHA for solving: {}", code)
+                raise CaptchaSolveException
+
+            try:
+                # Get the response, retry every 5 seconds if it's not ready
+                params = {
+                    'key': conf.CAPTCHA_KEY,
+                    'action': 'get',
+                    'id': code,
+                    'json': 1
+                }
+                while True:
+                    async with session.get("http://2captcha.com/res.php", params=params, timeout=20) as resp:
+                        response = await resp.json(loads=json_loads)
+                    if response.get('request') != 'CAPCHA_NOT_READY':
+                        break
+                    await sleep(5, loop=LOOP)
+            except CancelledError:
+                raise
+            except Exception as e:
+                self.log.error('Got an error while trying to solve CAPTCHA. '
+                                  'Check your API Key and account balance.')
+                raise CaptchaSolveException from e
+
+            token = response.get('request')
+            if not response.get('status') == 1:
+                self.log.error("Failed to get CAPTCHA response: {}", token)
+                raise CaptchaSolveException
+        else:
+            try:
+                acclient = AnticaptchaClient(conf.CAPTCHA_KEY)
+                actask = NoCaptchaTaskProxylessTask(challenge_url, '6LeeTScTAAAAADqvhqVMhPpr_vB9D364Ia-1dSgK')
+                acjob = acclient.createTask(actask)
+                acjob.join()
+                token = acjob.get_solution_response()
+            except AnticatpchaException as e:
+                self.log.error('AntiCaptcha error: {}, {}', e.error_code, e.error_description)
+                raise CaptchaException from e
+            except Exception as e:
+                self.log.error('Other error from anticaptcha')
+                raise CaptchaException from e
 
         request = self.api.create_request()
         request.verify_challenge(token=token)
         await self.call(request, action=4)
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         self.log.warning("Successfully solved CAPTCHA")
 
     def simulate_jitter(self, amount=0.00002):
@@ -1577,7 +1644,7 @@ class Worker:
         self.altitude = uniform(self.altitude - 1, self.altitude + 1)
         self.api.set_position(*self.location, self.altitude)
 
-    def update_accounts_dict(self):
+    async def update_accounts_dict(self):
         self.account['location'] = self.location
         self.account['time'] = self.last_request
         self.account['inventory_timestamp'] = self.inventory_timestamp
@@ -1595,7 +1662,8 @@ class Worker:
             if self.username in ACCOUNTS:
                 del ACCOUNTS[self.username]
         else:
-            Account.put(self.account)
+            async with self.update_account_lock:
+                Account.put(self.account)
             ACCOUNTS[self.username] = self.account
 
     async def remove_account(self, flag='banned'):
@@ -1618,6 +1686,9 @@ class Worker:
         elif flag == 'security':
             self.account['security'] = True
             self.log.warning('Removing {} due to security lock.', self.username)
+        elif flag == 'temp_disabled':
+            self.account['temp_disabled'] = True
+            self.log.warning('Removing {} due to temp disabled.', self.username)
         elif flag == 'level30':
             self.account['graduated'] = True
             self.log.warning('Removing {} from slave pool due to graduation to Lv.30.', self.username)
@@ -1627,7 +1698,7 @@ class Worker:
         else:
             self.account['banned'] = True
             self.log.warning('Hibernating {} due to ban.', self.username)
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         self.username = None
         self.account = None
         await self.new_account(after_remove=True)
@@ -1636,7 +1707,7 @@ class Worker:
         self.error_code = 'BENCHING'
         self.log.warning('Swapping {} due to CAPTCHA.', self.username)
         self.account['captcha'] = True
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         self.captcha_queue.put(self.account)
         await self.new_account()
 
@@ -1660,7 +1731,7 @@ class Worker:
             self.log.warning('Swapping {} which had been running for {}.', self.username, timestr)
         else:
             self.log.warning('Swapping out {} because {}.', self.username, reason)
-        self.update_accounts_dict()
+        await self.update_accounts_dict()
         accounts_in_queues = self.account_queue.qsize() + self.captcha_queue.qsize()
         self.account_queue.put(self.account)
         direct_from_db = accounts_in_queues < self.required_extra_accounts()
@@ -1670,12 +1741,13 @@ class Worker:
         try:
             return await run_threaded(Account.get, self.min_level(), self.max_level())
         except InsufficientAccountsException:
-            raise InsufficientAccountsException("No more accounts available in DB #1")
+            self.log.error("No more accounts available in DB #1")
 
     async def new_account(self, after_remove=False, direct_from_db=False):
         if direct_from_db:
             self.account = await self.get_account_from_db()
-            self.log.warning('Acquired new account {} direct from DB.', self.account.get('username'))
+            if self.account:
+                self.log.info('Acquired new account {} direct from DB.', self.account.get('username'))
         else:
             if (conf.CAPTCHA_KEY
                     and (conf.FAVOR_CAPTCHA or self.account_queue.empty())
@@ -1686,32 +1758,34 @@ class Worker:
                     self.account = self.account_queue.get_nowait()
                 except Empty as e:
                     if after_remove:
-                        raise InsufficientAccountsException("No more accounts available in DB #2")
+                        self.log.error("No more accounts available in DB #2")
                     else:
                         self.account = await run_threaded(self.account_queue.get)
                 except InsufficientAccountsException:
-                    raise InsufficientAccountsException("No more accounts available in DB #3")
-            self.username = self.account['username']
-            try:
-                self.location = self.account['location'][:2]
-            except KeyError:
-                self.location = self.get_start_coords()
-            self.inventory_timestamp = self.account.get('inventory_timestamp', 0) if self.items else 0
-            self.player_level = self.account.get('level')
-            self.last_request = self.account.get('time', 0)
-            self.last_action = self.last_request
-            self.last_gmo = self.last_request
-            try:
-                self.items = self.account['items']
-                self.bag_items = sum(self.items.values())
-            except KeyError:
-                self.account['items'] = {}
-                self.items = self.account['items']
-            self.num_captchas = 0
-            self.eggs = {}
-            self.unused_incubators = deque()
-            self.initialize_api()
-            self.error_code = None
+                    self.log.error("No more accounts available in DB #3")
+        if not self.account:
+            return
+        self.username = self.account['username']
+        try:
+            self.location = self.account['location'][:2]
+        except KeyError:
+            self.location = self.get_start_coords()
+        self.inventory_timestamp = self.account.get('inventory_timestamp', 0) if self.items else 0
+        self.player_level = self.account.get('level')
+        self.last_request = self.account.get('time', 0)
+        self.last_action = self.last_request
+        self.last_gmo = self.last_request
+        try:
+            self.items = self.account['items']
+            self.bag_items = sum(self.items.values())
+        except KeyError:
+            self.account['items'] = {}
+            self.items = self.account['items']
+        self.num_captchas = 0
+        self.eggs = {}
+        self.unused_incubators = deque()
+        self.initialize_api()
+        self.error_code = None
 
     def within_distance(self, fort, max_distance=445):
         gym_location = fort.latitude, fort.longitude
